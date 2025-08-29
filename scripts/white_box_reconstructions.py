@@ -43,7 +43,9 @@ with torch.no_grad():
         inputs = processor(img, return_tensors="pt")
         inputs = {k: v.to(ijepa_device) for k, v in inputs.items()}
         outputs = ijepa(**inputs)
-        emb = outputs.last_hidden_state.mean(dim=1).squeeze(0).cpu()
+        context_mask = inputs["bool_masked_pos"] == 0
+        hidden = outputs.last_hidden_state  # [1, num_patches, dim]
+        emb = hidden[context_mask].mean(dim=0).cpu()  # average context patches
         embeddings.append(emb)
 
 # free ijepa

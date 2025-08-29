@@ -36,13 +36,20 @@ vae.eval()
 # -------------------------------
 # Embedding extraction function
 # -------------------------------
-def extract_embedding(image):
-    """Extract I-JEPA embedding from a PIL image."""
+
+
+# extract the embeddings of the context encoder only!
+def extract_embedding(image, mask_ratio=0.6):
+    """Extract I-JEPA context embedding from visible patches only."""
     img_224 = image.resize((224, 224))
     inputs = processor(img_224, return_tensors="pt").to(device)
+    
+    # Apply masking to simulate I-JEPA's context encoder
+    # (You'd need to implement the masking strategy I-JEPA uses)
     with torch.no_grad():
-        outputs = ijepa(**inputs)
-    return outputs.last_hidden_state.mean(dim=1).squeeze(0)  # [dim]
+        # Get embeddings only from visible (context) patches
+        context_outputs = ijepa.get_context_embedding(inputs, mask_ratio=mask_ratio)
+    return context_outputs
 
 # -------------------------------
 # Load CIFAR-10 dataset
@@ -97,10 +104,6 @@ np.save("data/test_pairs.npy", {
 })
 
 print("Saved: data/train_pairs.npy & data/test_pairs.npy")
-
-
-
-
 
 
 
