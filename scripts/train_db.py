@@ -77,17 +77,19 @@ dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
 
 # Inversion model
 class InversionModel(nn.Module):
-    def __init__(self, embedding_dim=1280, input_channels=32, feature_size=64, output_channels=4):
+    def __init__(self, embedding_dim=1280, proj_C=128, proj_H=16, proj_W=16, output_channels=4):
         super().__init__()
-        self.projector = nn.Linear(embedding_dim, input_channels * feature_size * feature_size)
-        self.unet = UNet(input_channels, output_channels, feature_size=feature_size)
+        self.proj_C, self.proj_H, self.proj_W = proj_C, proj_H, proj_W
+        self.projector = nn.Linear(embedding_dim, proj_C * proj_H * proj_W)
+        self.unet = UNet(input_channels=proj_C, output_channels=output_channels, feature_size=proj_H)
 
     def forward(self, x):
         proj = self.projector(x)
-        proj = proj.view(-1, 32, 64, 64)
+        proj = proj.view(-1, self.proj_C, self.proj_H, self.proj_W)
         return self.unet(proj)
 
-inv_model = InversionModel().to(device)
+inv_model = InversionModel(proj_C=128, proj_H=16, proj_W=16).to(device)
+
 optimizer = optim.Adam(inv_model.parameters(), lr=args.lr)
 
 # Training: loss on decoded images
