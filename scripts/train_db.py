@@ -11,6 +11,7 @@ import numpy as np
 import torchvision.transforms.functional as TF
 from torch.nn.functional import mse_loss
 import argparse
+from prepare_dataset import InversionDataset
 from models.unet import UNet
 
 parser = argparse.ArgumentParser()
@@ -27,54 +28,19 @@ print(f"Using device: {device}")
 if device == "cuda":
     torch.cuda.empty_cache()
 
-# Load I-JEPA
-processor = AutoProcessor.from_pretrained("facebook/ijepa_vith14_1k")
-model = AutoModel.from_pretrained("facebook/ijepa_vith14_1k").to(device)
-model.eval()
-
 # Load SD VAE
 vae = AutoencoderKL.from_pretrained("stabilityai/stable-diffusion-2-1", subfolder="vae").to(device)
 vae.eval()
 
-# Extract embedding
-def extract_embedding(image):
-    img_224 = image.resize((224, 224))
-    inputs = processor(img_224, return_tensors="pt").to(device)
-    with torch.no_grad():
-        outputs = model(**inputs)
-    return outputs.last_hidden_state.mean(dim=1).squeeze(0)
+# load the training data
+train_data = np.load("data/train_pairs.npy", allow_pickle=True).item()
+dataset = InversionDataset(
+    torch.tensor(train_data["embeddings"], dtype=torch.float32),
+    torch.tensor(train_data["latents"], dtype=torch.float32),
+)
+print(f"Train dataset size: {len(dataset)}")
 
-# Dataset: CIFAR resized to 512
-cifar10 = datasets.CIFAR10(root='./data', train=True, download=True)  # No transform
-images = [cifar10[i][0].resize((512, 512)) for i in range(100)]
-embeddings = [extract_embedding(img).cpu() for img in images]
-
-image_tensors = torch.stack([TF.to_tensor(img) for img in images]).to(device)  # [100, 3, 512, 512]
-
-# Precompute latents
-with torch.no_grad():
-    latents = vae.encode(image_tensors * 2 - 1).latent_dist.sample() * vae.config.scaling_factor
-
-embedding_tensors = torch.stack(embeddings).to(device)
-
-# Save pairs (images at 512, embeddings from 224)
-np.save('data/pairs_db.npy', {'images': image_tensors.cpu().numpy(), 'embeddings': embedding_tensors.cpu().numpy()})
-
-# Dataset: emb to latent
-class InversionDataset(torch.utils.data.Dataset):
-    def __init__(self, embeddings, latents):
-        self.embeddings = embeddings
-        self.latents = latents
-
-    def __len__(self):
-        return len(self.embeddings)
-
-    def __getitem__(self, idx):
-        return self.embeddings[idx], self.latents[idx]
-
-dataset = InversionDataset(embedding_tensors, latents)
 dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
-
 # Inversion model
 class InversionModel(nn.Module):
     def __init__(self, embedding_dim=1280, proj_C=128, proj_H=16, proj_W=16, output_channels=4):

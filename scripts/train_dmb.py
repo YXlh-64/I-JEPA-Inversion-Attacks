@@ -8,6 +8,7 @@ from diffusers import StableDiffusionPipeline, DDIMScheduler
 from torchvision import datasets, transforms
 from PIL import Image
 import numpy as np
+from prepare_dataset import InversionDataset
 import torchvision.transforms.functional as TF
 from torch.nn.functional import mse_loss
 import argparse
@@ -27,48 +28,18 @@ print(f"Using device: {device}")
 if device == "cuda":
     torch.cuda.empty_cache()
 
-# Load I-JEPA
-processor = AutoProcessor.from_pretrained("facebook/ijepa_vith14_1k")
-model = AutoModel.from_pretrained("facebook/ijepa_vith14_1k").to(device)
-model.eval()
-
 # Load SD pipeline
 pipe = StableDiffusionPipeline.from_pretrained("stabilityai/stable-diffusion-2-1").to(device)
 pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
 
-# Extract embedding
-def extract_embedding(image):
-    img_224 = image.resize((224, 224))
-    inputs = processor(img_224, return_tensors="pt").to(device)
-    with torch.no_grad():
-        outputs = model(**inputs)
-    return outputs.last_hidden_state.mean(dim=1).squeeze(0)
+# load the training data
+train_data = np.load("data/train_pairs.npy", allow_pickle=True).item()
+dataset = InversionDataset(
+    torch.tensor(train_data["embeddings"], dtype=torch.float32),
+    torch.tensor(train_data["latents"], dtype=torch.float32),
+)
+print(f"Train dataset size: {len(dataset)}")
 
-# Dataset
-cifar10 = datasets.CIFAR10(root='./data', train=True, download=True)  # No transform
-images = [cifar10[i][0].resize((512, 512)) for i in range(100)]
-embeddings = [extract_embedding(img).cpu() for img in images]
-
-image_tensors = torch.stack([TF.to_tensor(img) for img in images]).to(device)  # 0-1
-
-embedding_tensors = torch.stack(embeddings).to(device)
-
-# Save pairs
-np.save('data/pairs_dmb.npy', {'images': image_tensors.cpu().numpy(), 'embeddings': embedding_tensors.cpu().numpy()})
-
-# Dataset: emb to image
-class InversionDataset(torch.utils.data.Dataset):
-    def __init__(self, embeddings, images):
-        self.embeddings = embeddings
-        self.images = images
-
-    def __len__(self):
-        return len(self.embeddings)
-
-    def __getitem__(self, idx):
-        return self.embeddings[idx], self.images[idx]
-
-dataset = InversionDataset(embedding_tensors, image_tensors)
 dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
 
 # Inversion model for z_T
