@@ -1,0 +1,17 @@
+name: ijepa-inversion
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python>=3.8
+  - pytorch>=2.0.0
+  - torchvision>=0.15.0
+  - transformers>=4.30.0
+  - diffusers>=0.20.0
+  - numpy>=1.24.0
+  - pillow>=9.0.0
+  - pytorch-msssim>=1.0.0
+  - pip
+  - pip:
+      - lpips>=0.1.4
