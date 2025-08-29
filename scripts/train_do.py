@@ -1,5 +1,3 @@
-# scripts/train_do.py
-# This script trains the inversion network for Direct Optimization (DO).
 
 import torch
 import torch.nn as nn
@@ -20,28 +18,35 @@ parser.add_argument('--batch_size', type=int, default=32)
 parser.add_argument('--lr', type=float, default=0.001)
 args = parser.parse_args()
 
+# Set device
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Using device: {device}")
+
+# Clear GPU memory
+if device == "cuda":
+    torch.cuda.empty_cache()
+
 # Load I-JEPA model and processor
 processor = AutoProcessor.from_pretrained("facebook/ijepa_vith14_1k")
-model = AutoModel.from_pretrained("facebook/ijepa_vith14_1k")
+model = AutoModel.from_pretrained("facebook/ijepa_vith14_1k").to(device)
 model.eval()
 
 # Function to extract context embedding
 def extract_embedding(image):
-    inputs = processor(image, return_tensors="pt")
+    inputs = processor(image, return_tensors="pt").to(device)
     with torch.no_grad():
         outputs = model(**inputs)
     embedding = outputs.last_hidden_state.mean(dim=1)  # [1, 1280]
     return embedding.squeeze(0)
 
 # Prepare dataset: use CIFAR10 resized to 224x224
-cifar10 = datasets.CIFAR10(root='./data', train=True, download=True, transform=transforms.ToPILImage())
-
+cifar10 = datasets.CIFAR10(root='./data', train=True, download=True)  # No transform
 # For demo, small subset
-images = [cifar10[i][0].resize((224, 224)) for i in range(100)]
-embeddings = [extract_embedding(img) for img in images]
+images = [cifar10[i][0].resize((224, 224)) for i in range(100)]  # Already PIL Images
+embeddings = [extract_embedding(img).cpu() for img in images]  # Move to CPU for saving
 
-image_tensors = torch.stack([TF.to_tensor(img) * 2 - 1 for img in images])  # To -1 to 1
-embedding_tensors = torch.stack(embeddings)  # [100, 1280]
+image_tensors = torch.stack([TF.to_tensor(img) * 2 - 1 for img in images]).to(device)  # To -1 to 1
+embedding_tensors = torch.stack(embeddings).to(device)  # [100, 1280]
 
 # Save pairs
 np.save('data/pairs_do.npy', {'images': image_tensors.cpu().numpy(), 'embeddings': embedding_tensors.cpu().numpy()})
@@ -73,7 +78,7 @@ class InversionModel(nn.Module):
         proj = proj.view(-1, 32, 224, 224)
         return self.unet(proj)
 
-f_inv = InversionModel()
+f_inv = InversionModel().to(device)
 optimizer = optim.Adam(f_inv.parameters(), lr=args.lr)
 
 # TV loss
@@ -83,6 +88,7 @@ def tv_loss(img):
 # Training loop
 for epoch in range(args.epochs):
     for emb, img in dataloader:
+        emb, img = emb.to(device), img.to(device)
         recon = f_inv(emb)
         loss_re = mse_loss(recon, img)
         loss_tv = tv_loss(recon)

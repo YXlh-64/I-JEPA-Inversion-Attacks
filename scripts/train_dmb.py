@@ -1,5 +1,3 @@
-# scripts/train_dmb.py
-# This script trains the inversion network for Diffusion Model-Based (DMB).
 
 import torch
 import torch.nn as nn
@@ -17,37 +15,43 @@ from models.unet import UNet
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--epochs', type=int, default=10)
-parser.add_argument('--batch_size', type=int, default=4)  # Small for diffusion
+parser.add_argument('--batch_size', type=int, default=2)  # Reduced for Kaggle GPU
 parser.add_argument('--lr', type=float, default=0.001)
 args = parser.parse_args()
 
+# Set device
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Using device: {device}")
+
+# Clear GPU memory
+if device == "cuda":
+    torch.cuda.empty_cache()
+
 # Load I-JEPA
 processor = AutoProcessor.from_pretrained("facebook/ijepa_vith14_1k")
-model = AutoModel.from_pretrained("facebook/ijepa_vith14_1k")
+model = AutoModel.from_pretrained("facebook/ijepa_vith14_1k").to(device)
 model.eval()
 
 # Load SD pipeline
-pipe = StableDiffusionPipeline.from_pretrained("stabilityai/stable-diffusion-2-1")
+pipe = StableDiffusionPipeline.from_pretrained("stabilityai/stable-diffusion-2-1").to(device)
 pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
-pipe.to("cuda" if torch.cuda.is_available() else "cpu")  # For speed
 
 # Extract embedding
 def extract_embedding(image):
     img_224 = image.resize((224, 224))
-    inputs = processor(img_224, return_tensors="pt")
+    inputs = processor(img_224, return_tensors="pt").to(device)
     with torch.no_grad():
         outputs = model(**inputs)
     return outputs.last_hidden_state.mean(dim=1).squeeze(0)
 
 # Dataset
-cifar10 = datasets.CIFAR10(root='./data', train=True, download=True, transform=transforms.ToPILImage())
-
+cifar10 = datasets.CIFAR10(root='./data', train=True, download=True)  # No transform
 images = [cifar10[i][0].resize((512, 512)) for i in range(100)]
-embeddings = [extract_embedding(img) for img in images]
+embeddings = [extract_embedding(img).cpu() for img in images]
 
-image_tensors = torch.stack([TF.to_tensor(img) for img in images])  # 0-1
+image_tensors = torch.stack([TF.to_tensor(img) for img in images]).to(device)  # 0-1
 
-embedding_tensors = torch.stack(embeddings)
+embedding_tensors = torch.stack(embeddings).to(device)
 
 # Save pairs
 np.save('data/pairs_dmb.npy', {'images': image_tensors.cpu().numpy(), 'embeddings': embedding_tensors.cpu().numpy()})
@@ -79,12 +83,13 @@ class InversionModel(nn.Module):
         proj = proj.view(-1, 32, 64, 64)
         return self.unet(proj)
 
-inv_model = InversionModel()
+inv_model = InversionModel().to(device)
 optimizer = optim.Adam(inv_model.parameters(), lr=args.lr)
 
 # Training
 for epoch in range(args.epochs):
     for emb, target_img in dataloader:
+        emb, target_img = emb.to(device), target_img.to(device)
         pred_z_t = inv_model(emb)
         # Run diffusion
         with torch.no_grad():

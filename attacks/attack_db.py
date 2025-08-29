@@ -5,15 +5,23 @@ from diffusers import AutoencoderKL
 from torchvision.utils import save_image
 from pytorch_msssim import ssim
 import lpips
-from ..models.unet import UNet
+from models.unet import UNet
+
+# Set device
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Using device: {device}")
+
+# Clear GPU memory
+if device == "cuda":
+    torch.cuda.empty_cache()
 
 # Load pairs
 pairs = np.load('data/pairs_db.npy', allow_pickle=True).item()
-embeddings = torch.from_numpy(pairs['embeddings'])[90:]
-images = torch.from_numpy(pairs['images'])[90:]
+embeddings = torch.from_numpy(pairs['embeddings'])[90:].to(device)
+images = torch.from_numpy(pairs['images'])[90:].to(device)
 
 # Load VAE
-vae = AutoencoderKL.from_pretrained("stabilityai/stable-diffusion-2-1", subfolder="vae")
+vae = AutoencoderKL.from_pretrained("stabilityai/stable-diffusion-2-1", subfolder="vae").to(device)
 vae.eval()
 
 # Inversion model
@@ -28,12 +36,12 @@ class InversionModel(torch.nn.Module):
         proj = proj.view(-1, 32, 64, 64)
         return self.unet(proj)
 
-inv_model = InversionModel()
-inv_model.load_state_dict(torch.load('saved_models/db_inv.pth'))
+inv_model = InversionModel().to(device)
+inv_model.load_state_dict(torch.load('saved_models/db_inv.pth', map_location=device))
 inv_model.eval()
 
 # Initialize LPIPS
-loss_fn_lpips = lpips.LPIPS(net='vgg')
+loss_fn_lpips = lpips.LPIPS(net='vgg').to(device)
 
 # Invert
 with torch.no_grad():

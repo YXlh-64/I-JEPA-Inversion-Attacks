@@ -1,5 +1,3 @@
-# scripts/train_db.py
-# This script trains the inversion network for Decoder-Based (DB).
 
 import torch
 import torch.nn as nn
@@ -21,37 +19,43 @@ parser.add_argument('--batch_size', type=int, default=8)
 parser.add_argument('--lr', type=float, default=0.001)
 args = parser.parse_args()
 
+# Set device
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Using device: {device}")
+
+# Clear GPU memory
+if device == "cuda":
+    torch.cuda.empty_cache()
+
 # Load I-JEPA
 processor = AutoProcessor.from_pretrained("facebook/ijepa_vith14_1k")
-model = AutoModel.from_pretrained("facebook/ijepa_vith14_1k")
+model = AutoModel.from_pretrained("facebook/ijepa_vith14_1k").to(device)
 model.eval()
 
 # Load SD VAE
-vae = AutoencoderKL.from_pretrained("stabilityai/stable-diffusion-2-1", subfolder="vae")
+vae = AutoencoderKL.from_pretrained("stabilityai/stable-diffusion-2-1", subfolder="vae").to(device)
 vae.eval()
 
 # Extract embedding
 def extract_embedding(image):
-    # Resize to 224 for I-JEPA
     img_224 = image.resize((224, 224))
-    inputs = processor(img_224, return_tensors="pt")
+    inputs = processor(img_224, return_tensors="pt").to(device)
     with torch.no_grad():
         outputs = model(**inputs)
     return outputs.last_hidden_state.mean(dim=1).squeeze(0)
 
 # Dataset: CIFAR resized to 512
-cifar10 = datasets.CIFAR10(root='./data', train=True, download=True, transform=transforms.ToPILImage())
-
+cifar10 = datasets.CIFAR10(root='./data', train=True, download=True)  # No transform
 images = [cifar10[i][0].resize((512, 512)) for i in range(100)]
-embeddings = [extract_embedding(img) for img in images]
+embeddings = [extract_embedding(img).cpu() for img in images]
 
-image_tensors = torch.stack([TF.to_tensor(img) for img in images])  # [100, 3, 512, 512]
+image_tensors = torch.stack([TF.to_tensor(img) for img in images]).to(device)  # [100, 3, 512, 512]
 
 # Precompute latents
 with torch.no_grad():
     latents = vae.encode(image_tensors * 2 - 1).latent_dist.sample() * vae.config.scaling_factor
 
-embedding_tensors = torch.stack(embeddings)
+embedding_tensors = torch.stack(embeddings).to(device)
 
 # Save pairs (images at 512, embeddings from 224)
 np.save('data/pairs_db.npy', {'images': image_tensors.cpu().numpy(), 'embeddings': embedding_tensors.cpu().numpy()})
@@ -83,12 +87,13 @@ class InversionModel(nn.Module):
         proj = proj.view(-1, 32, 64, 64)
         return self.unet(proj)
 
-inv_model = InversionModel()
+inv_model = InversionModel().to(device)
 optimizer = optim.Adam(inv_model.parameters(), lr=args.lr)
 
 # Training: loss on decoded images
 for epoch in range(args.epochs):
     for emb, target_latent in dataloader:
+        emb, target_latent = emb.to(device), target_latent.to(device)
         pred_latent = inv_model(emb)
         with torch.no_grad():
             recon = vae.decode(pred_latent / vae.config.scaling_factor).sample
