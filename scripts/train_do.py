@@ -83,7 +83,13 @@ optimizer = optim.Adam(f_inv.parameters(), lr=args.lr)
 
 # TV loss
 def tv_loss(img):
-    return torch.mean(torch.abs(img[:, :, :-1, :] - img[:, :, 1:, :]) + torch.abs(img[:, :, :, :-1] - img[:, :, :, 1:]))
+    # img shape: [batch_size, channels, height, width]
+    h_diff = torch.abs(img[:, :, :-1, :] - img[:, :, 1:, :])  # Shape: [batch_size, channels, height-1, width]
+    w_diff = torch.abs(img[:, :, :, :-1] - img[:, :, :, 1:])  # Shape: [batch_size, channels, height, width-1]
+    # Crop h_diff to match w_diff's height
+    h_diff = h_diff[:, :, :, :-1]  # Shape: [batch_size, channels, height-1, width-1]
+    w_diff = w_diff[:, :, :-1, :]  # Shape: [batch_size, channels, height-1, width-1]
+    return torch.mean(h_diff + w_diff)
 
 # Training loop
 for epoch in range(args.epochs):
