@@ -30,10 +30,16 @@ ijepa_device = 'cpu' if device == 'cpu' else device
 ijepa.to(ijepa_device).eval()
 
 # Prepare dataset: CIFAR10 resized to 224
-cifar10 = datasets.CIFAR10(root='./data', train=True, download=True, transform=transforms.Resize((224,224)))
+cifar10 = datasets.CIFAR10(
+    root='./data', 
+    train=True, 
+    download=True, 
+    transform=transforms.Resize((224,224))
+)
+
 # small subset for demo
-N = 100
-images_pil = [cifar10[i][0].convert('RGB') for i in range(N)]
+N_train, N_test = 10000, 200
+images_pil = [cifar10[i][0].convert('RGB') for i in range(N_train + N_test)]
 
 # helper to extract embeddings (do in batches to avoid keeping model + big tensors)
 embeddings = []
@@ -54,8 +60,21 @@ torch.cuda.empty_cache()
 image_tensors_cpu = torch.stack([TF.to_tensor(img) * 2 - 1 for img in images_pil])  # [-1,1], CPU
 embedding_tensors_cpu = torch.stack(embeddings)  # CPU
 
-np.save('data/pairs_sd.npy', {'images': image_tensors_cpu.numpy(), 'embeddings': embedding_tensors_cpu.numpy()})
-print("Saved pairs to data/pairs_sd.npy")
+# Split train/test
+train_images = image_tensors_cpu[:N_train]
+test_images  = image_tensors_cpu[N_train:]
+train_embeds = embedding_tensors_cpu[:N_train]
+test_embeds  = embedding_tensors_cpu[N_train:]
+
+# Save dictionary
+os.makedirs("data", exist_ok=True)
+np.save('data/pairs_sd.npy', {
+    'train_images': train_images.numpy(),
+    'train_embeddings': train_embeds.numpy(),
+    'test_images': test_images.numpy(),
+    'test_embeddings': test_embeds.numpy()
+})
+print("Saved train/test pairs to data/pairs_sd.npy")
 
 # --- Dataset / Dataloader (keep tensors on CPU, move per-batch to GPU) ---
 class InversionDataset(torch.utils.data.Dataset):

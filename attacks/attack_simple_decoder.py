@@ -22,8 +22,8 @@ print("Device:", device)
 os.makedirs('results', exist_ok=True)
 
 pairs = np.load('data/pairs_sd.npy', allow_pickle=True).item()
-embeddings = torch.from_numpy(pairs['embeddings'])[90:]  # still on CPU
-images = torch.from_numpy(pairs['images'])[90:]
+embeddings = torch.from_numpy(pairs['test_embeddings'])  # [200, 1280]
+images = torch.from_numpy(pairs['test_images'])          # [200, 3, 224, 224]
 
 # Recreate model architecture exactly as training (proj_C=128, 16x16)
 class SmallDecoder(torch.nn.Module):
