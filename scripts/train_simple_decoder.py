@@ -1,4 +1,3 @@
-# train_do.py (revised)
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -55,8 +54,8 @@ torch.cuda.empty_cache()
 image_tensors_cpu = torch.stack([TF.to_tensor(img) * 2 - 1 for img in images_pil])  # [-1,1], CPU
 embedding_tensors_cpu = torch.stack(embeddings)  # CPU
 
-np.save('data/pairs_do.npy', {'images': image_tensors_cpu.numpy(), 'embeddings': embedding_tensors_cpu.numpy()})
-print("Saved pairs to data/pairs_do.npy")
+np.save('data/pairs_sd.npy', {'images': image_tensors_cpu.numpy(), 'embeddings': embedding_tensors_cpu.numpy()})
+print("Saved pairs to data/pairs_sd.npy")
 
 # --- Dataset / Dataloader (keep tensors on CPU, move per-batch to GPU) ---
 class InversionDataset(torch.utils.data.Dataset):
@@ -141,5 +140,5 @@ for epoch in range(args.epochs):
     torch.cuda.empty_cache()
 
 # Save model
-torch.save(f_inv.state_dict(), 'saved_models/do_inv.pth')
-print("Saved model to saved_models/do_inv.pth")
+torch.save(f_inv.state_dict(), 'saved_models/sd_inv.pth')
+print("Saved model to saved_models/sd_inv.pth")
