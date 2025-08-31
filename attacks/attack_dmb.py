@@ -16,9 +16,9 @@ if device == "cuda":
     torch.cuda.empty_cache()
 
 # Load pairs
-pairs = np.load('data/pairs_dmb.npy', allow_pickle=True).item()
-embeddings = torch.from_numpy(pairs['embeddings'])[90:].to(device)
-images = torch.from_numpy(pairs['images'])[90:].to(device)
+pairs = np.load('data/pairs_sd.npy', allow_pickle=True).item()
+embeddings = torch.from_numpy(pairs['test_embeddings'])
+images = torch.from_numpy(pairs['test_images'])
 
 # Load pipe
 pipe = StableDiffusionPipeline.from_pretrained("stabilityai/stable-diffusion-2-1").to(device)

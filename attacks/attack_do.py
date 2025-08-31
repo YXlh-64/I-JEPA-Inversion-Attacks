@@ -13,9 +13,9 @@ if device == "cuda":
     torch.cuda.empty_cache()
 
 # Load pairs
-pairs = np.load('data/pairs_do.npy', allow_pickle=True).item()
-embeddings = torch.from_numpy(pairs['embeddings'])[90:].to(device)
-images = torch.from_numpy(pairs['images'])[90:].to(device)
+pairs = np.load('data/pairs_sd.npy', allow_pickle=True).item()
+embeddings = torch.from_numpy(pairs['test_embeddings'])
+images = torch.from_numpy(pairs['test_images'])
 
 # Inversion model
 class InversionModel(torch.nn.Module):
