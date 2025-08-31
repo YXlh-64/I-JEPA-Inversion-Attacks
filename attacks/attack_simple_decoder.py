@@ -67,7 +67,7 @@ to_tensor = transforms.Compose([
 # MODE 1: Custom Images
 # ------------------------------
 if args.custom:
-    custom_dir = "custom_data"
+    custom_dir = "custom"
     os.makedirs(custom_dir, exist_ok=True)
 
     processor = AutoProcessor.from_pretrained("facebook/ijepa_vith14_1k")

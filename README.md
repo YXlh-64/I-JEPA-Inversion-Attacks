@@ -54,6 +54,14 @@ Install Miniconda or Anaconda from [conda.io](https://docs.conda.io/projects/con
     ```
 
 ## Usage:
+### Preparing the Dataset:
+This will load cifar-10 images, encode them using the Stable diffuison VAE and extract their embeddings from ijepa. Then, it stores the embeddings-latents pairs in the `data/` folder, and splits the training and testing images. To run the script just type the command below:
+```bash
+python scripts/prepare_dataset.py
+```
+* Output:
+  * Latent-embedding pairs saved in `data/train_pairs.npy` and `data/test_pairs.npy`
+
 ### Training:
 Train the inversion models for each attack. Adjust --epochs, --batch_size, and --lr as needed.
 ```bash
@@ -62,7 +70,6 @@ python scripts/train_db.py --epochs 10 --batch_size 8 --lr 0.001
 python scripts/train_dmb.py --epochs 10 --batch_size 4 --lr 0.001
 ```
 * Output:
-  * Image-embedding pairs saved in `data/pairs_*.npy`
   * Trained model weights saved in `saved_models/*_inv.pth`.
 
 ### Running Attacks:

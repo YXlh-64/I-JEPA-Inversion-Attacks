@@ -52,7 +52,7 @@ cifar_train = datasets.CIFAR10(root='./data', train=True, download=True)
 cifar_test = datasets.CIFAR10(root='./data', train=False, download=True)
 
 # Limit dataset size
-train_limit = 5000
+train_limit = 10000
 test_limit = 100
 
 # Resize to 512 for VAE
