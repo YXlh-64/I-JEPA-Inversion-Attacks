@@ -36,9 +36,6 @@ vae.eval()
 # -------------------------------
 # Embedding extraction function
 # -------------------------------
-
-
-# extract the embeddings of the context encoder only!
 def extract_embedding(image):
     """Extract I-JEPA embedding from a PIL image."""
     img_224 = image.resize((224, 224))
@@ -54,9 +51,13 @@ print("Loading CIFAR-10...")
 cifar_train = datasets.CIFAR10(root='./data', train=True, download=True)
 cifar_test = datasets.CIFAR10(root='./data', train=False, download=True)
 
+# Limit dataset size
+train_limit = 5000
+test_limit = 100
+
 # Resize to 512 for VAE
-train_images = [cifar_train[i][0].resize((512, 512)) for i in range(len(cifar_train))]
-test_images  = [cifar_test[i][0].resize((512, 512)) for i in range(len(cifar_test))]
+train_images = [cifar_train[i][0].resize((512, 512)) for i in range(train_limit)]
+test_images  = [cifar_test[i][0].resize((512, 512)) for i in range(test_limit)]
 
 # -------------------------------
 # Compute embeddings & tensors
@@ -100,9 +101,6 @@ np.save("data/test_pairs.npy", {
 })
 
 print("Saved: data/train_pairs.npy & data/test_pairs.npy")
-
-
-
 
 # -------------------------------
 # Dataset class for later training
