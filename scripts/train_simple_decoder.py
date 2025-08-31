@@ -38,7 +38,7 @@ cifar10 = datasets.CIFAR10(
 )
 
 # small subset for demo
-N_train, N_test = 8000, 50
+N_train, N_test = 5000, 50
 images_pil = [cifar10[i][0].convert('RGB') for i in range(N_train + N_test)]
 
 # helper to extract embeddings (do in batches to avoid keeping model + big tensors)
