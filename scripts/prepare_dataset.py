@@ -72,7 +72,7 @@ def parse_args():
     p.add_argument('--resize-vae', type=int, default=512)
     p.add_argument('--batch-size', type=int, default=128, help='Batch size for embedding + latent extraction pipeline')
     p.add_argument('--precision', type=str, default='fp16', choices=['fp32', 'fp16'])
-    p.add_argument('--out-dir', type=str, default='prepared_cifar')
+    p.add_argument('--out-dir', type=str, default='prepared_data')
     p.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     return p.parse_args()
 
