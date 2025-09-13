@@ -27,7 +27,7 @@ def parse_args():
     p.add_argument('--epochs', type=int, default=20)
     p.add_argument('--batch-size', type=int, default=64)
     p.add_argument('--lr', type=float, default=2e-4)
-    p.add_argument('--embedding-batch-size', type=int, default=128, help='batch size for forward IJepa embedding extraction')
+    p.add_argument('--embedding-batch-size', type=int, default=None, help='(deprecated) separate embedding extraction batch size; overrides --batch-size if set')
     p.add_argument('--num-workers', type=int, default=4)
     p.add_argument('--resize', type=int, default=224, help='resize shorter side to this size (square)')
     p.add_argument('--mixed-precision', action='store_true')
@@ -36,6 +36,8 @@ def parse_args():
     p.add_argument('--eval-every', type=int, default=1)
     p.add_argument('--resume', type=str, default='')
     p.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
+    p.add_argument('--print-freq', type=int, default=100, help='Print every N batches when tqdm disabled')
+    p.add_argument('--no-tqdm', action='store_true', help='Disable tqdm progress bars')
     return p.parse_args()
 
 
@@ -118,6 +120,9 @@ def main():
     device = args.device
     print(f"Device: {device}")
 
+    # NOTE: cuFFT/cuDNN/cuBLAS "already registered" warnings are benign (multiple framework initializations).
+    # To suppress some backend verbosity you may set: os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' before imports.
+
     # Data
     train_ds = CIFAR10Full('./data', True, args.resize)
     test_ds = CIFAR10Full('./data', False, args.resize)
@@ -140,12 +145,15 @@ def main():
         ckpt = torch.load(args.resume, map_location=device)
         inv.load_state_dict(ckpt['model'])
         opt.load_state_dict(ckpt['opt'])
-        scaler.load_state_dict(ckpt['scaler'])
+        if scaler and ckpt.get('scaler') is not None:
+            scaler.load_state_dict(ckpt['scaler'])
         start_epoch = ckpt['epoch'] + 1
         best_psnr = ckpt.get('best_psnr', best_psnr)
         print(f"Resumed from {args.resume} at epoch {start_epoch}")
 
     metrics_helper = ImageMetrics(device=device)
+
+    embed_bs = args.embedding_batch_size if args.embedding_batch_size else args.batch_size
 
     def iter_embed(ds, batch_size):
         for i in range(0, len(ds), batch_size):
@@ -159,16 +167,27 @@ def main():
             targets = torch.stack([image_to_tensor(img) for img in batch_imgs]).to(device)
             yield emb, targets
 
+    use_tqdm = not args.no_tqdm
+    if use_tqdm:
+        try:
+            from tqdm import tqdm
+        except ImportError:
+            use_tqdm = False
+
+    from contextlib import nullcontext
+
     for epoch in range(start_epoch, args.epochs):
         inv.train()
         total_loss = 0.0
         n_batches = 0
         printed_debug = False
-        for emb, target in iter_embed(train_ds, args.embedding_batch_size):
+        train_iter = iter_embed(train_ds, embed_bs)
+        if use_tqdm:
+            train_iter = tqdm(train_iter, total=math.ceil(len(train_ds)/embed_bs), desc=f"Train {epoch+1}/{args.epochs}", leave=False)
+        for emb, target in train_iter:
             if args.mixed_precision and device.startswith('cuda'):
                 autocast_ctx = torch.amp.autocast('cuda')
             else:
-                from contextlib import nullcontext
                 autocast_ctx = nullcontext()
             with autocast_ctx:
                 pred = inv(emb)
@@ -190,6 +209,8 @@ def main():
                 opt.step()
             total_loss += float(loss.item())
             n_batches += 1
+            if (not use_tqdm) and args.print_freq > 0 and (n_batches % args.print_freq == 0):
+                print(f"Epoch {epoch+1} batch {n_batches} loss={loss.item():.4f}")
         avg_loss = total_loss / max(1, n_batches)
         print(f"Epoch {epoch+1}/{args.epochs} train_loss={avg_loss:.4f}")
 
@@ -198,7 +219,10 @@ def main():
             psnr_sum = ssid_sum = lpips_sum = 0.0
             mcount = 0
             with torch.no_grad():
-                for emb, target in iter_embed(test_ds, args.embedding_batch_size):
+                eval_iter = iter_embed(test_ds, embed_bs)
+                if use_tqdm:
+                    eval_iter = tqdm(eval_iter, total=math.ceil(len(test_ds)/embed_bs), desc=f"Eval {epoch+1}", leave=False)
+                for emb, target in eval_iter:
                     pred = inv(emb)
                     if pred.shape[-2:] != target.shape[-2:]:
                         target = torch.nn.functional.interpolate(target, size=pred.shape[-2:], mode='bilinear', align_corners=False)
@@ -218,11 +242,11 @@ def main():
 
             # Save checkpoint
             ckpt_path = os.path.join(args.save_dir, 'last.pt')
-            atomic_save({'epoch': epoch, 'model': inv.state_dict(), 'opt': opt.state_dict(), 'scaler': scaler.state_dict(), 'best_psnr': best_psnr}, ckpt_path)
+            atomic_save({'epoch': epoch, 'model': inv.state_dict(), 'opt': opt.state_dict(), 'scaler': (scaler.state_dict() if scaler else None), 'best_psnr': best_psnr}, ckpt_path)
             if psnr_avg > best_psnr:
                 best_psnr = psnr_avg
                 best_path = os.path.join(args.save_dir, 'best.pt')
-                atomic_save({'epoch': epoch, 'model': inv.state_dict(), 'opt': opt.state_dict(), 'scaler': scaler.state_dict(), 'best_psnr': best_psnr}, best_path)
+                atomic_save({'epoch': epoch, 'model': inv.state_dict(), 'opt': opt.state_dict(), 'scaler': (scaler.state_dict() if scaler else None), 'best_psnr': best_psnr}, best_path)
                 print(f"  New best PSNR {best_psnr:.3f} saved -> {best_path}")
 
     print('Training complete.')
