@@ -17,12 +17,85 @@ import argparse
 import math
 from typing import Dict
 
+"""Train a simple embedding->image decoder on full CIFAR-10 leaving last 2000 images for test.
+
+Features:
+ - Uses entire CIFAR-10 (50k images) with first 48k for training, last 2k for test.
+ - No random subsetting. Deterministic split.
+ - Computes average PSNR/SSIM/LPIPS on test set each epoch.
+ - Robust checkpoint saving: atomic write + best metric (PSNR) tracking.
+ - Resume support via --resume flag (auto loads optimizer + scaler + epoch).
+ - Minimal simple embedding model (linear projector + small conv decoder).
+ - Embeddings are produced on-the-fly by frozen I-JEPA (memory efficient stream).
+ - Avoids saving with torch.save default risks by using temporary file + rename.
+"""
+
+from __future__ import annotations
+import os
+import argparse
+import math
+from typing import Dict
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader
 from torchvision import datasets, transforms
 import torchvision.transforms.functional as TF
+
+from transformers import AutoProcessor, AutoModel
+
+from utils.metrics import ImageMetrics
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument('--epochs', type=int, default=20)
+    p.add_argument('--batch-size', type=int, default=64)
+    p.add_argument('--lr', type=float, default=2e-4)
+    p.add_argument('--embedding-batch-size', type=int, default=128, help='batch size for forward IJepa embedding extraction')
+    p.add_argument('--num-workers', type=int, default=4)
+    p.add_argument('--resize', type=int, default=224, help='resize shorter side to this size (square)')
+    p.add_argument('--mixed-precision', action='store_true')
+    p.add_argument('--seed', type=int, default=42)
+    p.add_argument('--save-dir', type=str, default='checkpoints_simple_decoder')
+    p.add_argument('--eval-every', type=int, default=1)
+    p.add_argument('--resume', type=str, default='')
+    p.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
+    return p.parse_args()
+
+
+def set_seed(seed: int):
+    import random, numpy as np
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
+
+class CIFAR10Full(Dataset):
+    """CIFAR10 with deterministic split (train part) returning PIL image + index."""
+    def __init__(self, root: str, train_split: bool, resize: int):
+        tfm = transforms.Compose([
+            transforms.Resize((resize, resize)),
+            # Return PIL for processor; we convert to tensor after embedding for reconstruction target
+        ])
+        base = datasets.CIFAR10(root=root, train=True, download=True)
+        # Deterministic ordering as given (base.data order). Use last 2000 as test.
+        if train_split:
+            self.indices = list(range(0, 48000))
+        else:
+            self.indices = list(range(48000, 50000))
+        self.data = base.data
+        self.tfm = tfm
+        self.resize = resize
+
+    def __len__(self):
+        return len(self.indices)
+
 
 from transformers import AutoProcessor, AutoModel
 
@@ -90,34 +163,55 @@ def image_to_tensor(img):
     return t
 
 
+        real_idx = self.indices[idx]
+        # data is numpy array HWC uint8
+        from PIL import Image
+        img = Image.fromarray(self.data[real_idx])
+        img = self.tfm(img)
+        return img
+
+
+def image_to_tensor(img):
+    t = TF.to_tensor(img) * 2 - 1  # [-1,1]
+    return t
+
+
 class SmallDecoder(nn.Module):
-    def __init__(self, in_ch=128, out_ch=3):
+    def __init__(self, in_ch=128, out_ch=3, target_size=224):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.ConvTranspose2d(in_ch, 256, 4, 2, 1),
+        self.target_size = target_size
+        self.body = nn.Sequential(
+            nn.ConvTranspose2d(in_ch, 256, 4, 2, 1),  # 16->32
             nn.ReLU(True),
-            nn.ConvTranspose2d(256, 128, 4, 2, 1),
+            nn.ConvTranspose2d(256, 128, 4, 2, 1),    # 32->64
             nn.ReLU(True),
-            nn.ConvTranspose2d(128, 64, 4, 2, 1),
+            nn.ConvTranspose2d(128, 64, 4, 2, 1),     # 64->128
             nn.ReLU(True),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+        )
+        self.head = nn.Sequential(
+            nn.Upsample(size=(target_size, target_size), mode='bilinear', align_corners=False),
             nn.Conv2d(64, out_ch, 3, padding=1),
             nn.Tanh()
         )
 
+
     def forward(self, x):
-        return self.net(x)
+        x = self.body(x)
+        x = self.head(x)
+        return x
 
 
 class InversionModel(nn.Module):
-    def __init__(self, embedding_dim=1280, spatial=16, channels=128):
+    def __init__(self, embedding_dim=1280, spatial=16, channels=128, target_size=224):
         super().__init__()
         self.channels = channels
         self.spatial = spatial
         self.projector = nn.Linear(embedding_dim, channels * spatial * spatial)
-        self.decoder = SmallDecoder(in_ch=channels, out_ch=3)
+        self.decoder = SmallDecoder(in_ch=channels, out_ch=3, target_size=target_size)
 
     def forward(self, emb):
+        x = self.projector(emb)
+        x = x.view(-1, self.channels, self.spatial, self.spatial)
         x = self.projector(emb)
         x = x.view(-1, self.channels, self.spatial, self.spatial)
         return self.decoder(x)
@@ -146,7 +240,7 @@ def main():
     backbone.eval()
 
     # Inversion network
-    inv = InversionModel().to(device)
+    inv = InversionModel(target_size=args.resize).to(device)
 
     opt = optim.Adam(inv.parameters(), lr=args.lr)
     scaler = torch.cuda.amp.GradScaler(enabled=args.mixed_precision and device.startswith('cuda'))
@@ -182,9 +276,14 @@ def main():
         total_loss = 0.0
         n_batches = 0
         for emb, target in iter_embed(train_ds, args.embedding_batch_size):
-            with torch.cuda.amp.autocast(enabled=args.mixed_precision and device.startswith('cuda')):
+            autocast_ctx = torch.amp.autocast('cuda') if (args.mixed_precision and device.startswith('cuda')) else torch.autocast(device_type='cpu', enabled=False)
+            with autocast_ctx:
                 pred = inv(emb)
-                loss_recon = torch.nn.functional.l1_loss(pred, target)
+                if pred.shape != target.shape:
+                    target_resized = torch.nn.functional.interpolate(target, size=pred.shape[-2:], mode='bilinear', align_corners=False)
+                else:
+                    target_resized = target
+                loss_recon = torch.nn.functional.l1_loss(pred, target_resized)
                 # mild tv
                 tv = (pred[:, :, 1:, :] - pred[:, :, :-1, :]).abs().mean() + (pred[:, :, :, 1:] - pred[:, :, :, :-1]).abs().mean()
                 loss = loss_recon + 0.05 * tv
@@ -204,7 +303,11 @@ def main():
             with torch.no_grad():
                 for emb, target in iter_embed(test_ds, args.embedding_batch_size):
                     pred = inv(emb)
-                    batch_metrics = metrics_helper.compute(pred, target)
+                    if pred.shape != target.shape:
+                        target_eval = torch.nn.functional.interpolate(target, size=pred.shape[-2:], mode='bilinear', align_corners=False)
+                    else:
+                        target_eval = target
+                    batch_metrics = metrics_helper.compute(pred, target_eval)
                     for k, v in batch_metrics.items():
                         if k == 'psnr':
                             psnr_sum += v
