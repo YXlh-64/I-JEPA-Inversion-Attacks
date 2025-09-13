@@ -1,51 +1,24 @@
 """Train a simple embedding->image decoder on full CIFAR-10 leaving last 2000 images for test.
 
 Features:
- - Uses entire CIFAR-10 (50k images) with first 48k for training, last 2k for test.
- - No random subsetting. Deterministic split.
- - Computes average PSNR/SSIM/LPIPS on test set each epoch.
- - Robust checkpoint saving: atomic write + best metric (PSNR) tracking.
- - Resume support via --resume flag (auto loads optimizer + scaler + epoch).
- - Minimal simple embedding model (linear projector + small conv decoder).
- - Embeddings are produced on-the-fly by frozen I-JEPA (memory efficient stream).
- - Avoids saving with torch.save default risks by using temporary file + rename.
+ - Full CIFAR-10 (first 48k train, last 2k test) deterministic split.
+ - On-the-fly IJepa embeddings (backbone frozen).
+ - UNet-like tiny decoder (linear projector -> conv transpose stack).
+ - Dynamic output size equals --resize (default 224).
+ - Mixed precision (optional) with torch.amp APIs.
+ - Atomic checkpointing (last + best by PSNR) and resume.
+ - Average PSNR/SSIM/LPIPS over test batches.
 """
 
 from __future__ import annotations
-import os
-import argparse
-import math
+import os, argparse, math
 from typing import Dict
 
-"""Train a simple embedding->image decoder on full CIFAR-10 leaving last 2000 images for test.
-
-Features:
- - Uses entire CIFAR-10 (50k images) with first 48k for training, last 2k for test.
- - No random subsetting. Deterministic split.
- - Computes average PSNR/SSIM/LPIPS on test set each epoch.
- - Robust checkpoint saving: atomic write + best metric (PSNR) tracking.
- - Resume support via --resume flag (auto loads optimizer + scaler + epoch).
- - Minimal simple embedding model (linear projector + small conv decoder).
- - Embeddings are produced on-the-fly by frozen I-JEPA (memory efficient stream).
- - Avoids saving with torch.save default risks by using temporary file + rename.
-"""
-
-from __future__ import annotations
-import os
-import argparse
-import math
-from typing import Dict
-
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-from torch.utils.data import Dataset, DataLoader
+import torch, torch.nn as nn, torch.optim as optim
+from torch.utils.data import Dataset
 from torchvision import datasets, transforms
 import torchvision.transforms.functional as TF
-
 from transformers import AutoProcessor, AutoModel
-
 from utils.metrics import ImageMetrics
 
 
@@ -77,103 +50,20 @@ def set_seed(seed: int):
 
 
 class CIFAR10Full(Dataset):
-    """CIFAR10 with deterministic split (train part) returning PIL image + index."""
     def __init__(self, root: str, train_split: bool, resize: int):
-        tfm = transforms.Compose([
-            transforms.Resize((resize, resize)),
-            # Return PIL for processor; we convert to tensor after embedding for reconstruction target
-        ])
+        self.tfm = transforms.Compose([transforms.Resize((resize, resize))])
         base = datasets.CIFAR10(root=root, train=True, download=True)
-        # Deterministic ordering as given (base.data order). Use last 2000 as test.
-        if train_split:
-            self.indices = list(range(0, 48000))
-        else:
-            self.indices = list(range(48000, 50000))
+        self.indices = list(range(0, 48000)) if train_split else list(range(48000, 50000))
         self.data = base.data
-        self.tfm = tfm
-        self.resize = resize
-
     def __len__(self):
         return len(self.indices)
-
-
-from transformers import AutoProcessor, AutoModel
-
-from utils.metrics import ImageMetrics
-
-
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument('--epochs', type=int, default=20)
-    p.add_argument('--batch-size', type=int, default=64)
-    p.add_argument('--lr', type=float, default=2e-4)
-    p.add_argument('--embedding-batch-size', type=int, default=128, help='batch size for forward IJepa embedding extraction')
-    p.add_argument('--num-workers', type=int, default=4)
-    p.add_argument('--resize', type=int, default=224, help='resize shorter side to this size (square)')
-    p.add_argument('--mixed-precision', action='store_true')
-    p.add_argument('--seed', type=int, default=42)
-    p.add_argument('--save-dir', type=str, default='checkpoints_simple_decoder')
-    p.add_argument('--eval-every', type=int, default=1)
-    p.add_argument('--resume', type=str, default='')
-    p.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
-    return p.parse_args()
-
-
-def set_seed(seed: int):
-    import random, numpy as np
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-
-
-class CIFAR10Full(Dataset):
-    """CIFAR10 with deterministic split (train part) returning PIL image + index."""
-    def __init__(self, root: str, train_split: bool, resize: int):
-        tfm = transforms.Compose([
-            transforms.Resize((resize, resize)),
-            # Return PIL for processor; we convert to tensor after embedding for reconstruction target
-        ])
-        base = datasets.CIFAR10(root=root, train=True, download=True)
-        # Deterministic ordering as given (base.data order). Use last 2000 as test.
-        if train_split:
-            self.indices = list(range(0, 48000))
-        else:
-            self.indices = list(range(48000, 50000))
-        self.data = base.data
-        self.tfm = tfm
-        self.resize = resize
-
-    def __len__(self):
-        return len(self.indices)
-
     def __getitem__(self, idx):
-        real_idx = self.indices[idx]
-        # data is numpy array HWC uint8
         from PIL import Image
-        img = Image.fromarray(self.data[real_idx])
-        img = self.tfm(img)
-        return img
+        return self.tfm(Image.fromarray(self.data[self.indices[idx]]))
 
 
 def image_to_tensor(img):
-    t = TF.to_tensor(img) * 2 - 1  # [-1,1]
-    return t
-
-
-        real_idx = self.indices[idx]
-        # data is numpy array HWC uint8
-        from PIL import Image
-        img = Image.fromarray(self.data[real_idx])
-        img = self.tfm(img)
-        return img
-
-
-def image_to_tensor(img):
-    t = TF.to_tensor(img) * 2 - 1  # [-1,1]
-    return t
+    return TF.to_tensor(img) * 2 - 1
 
 
 class SmallDecoder(nn.Module):
@@ -212,8 +102,6 @@ class InversionModel(nn.Module):
     def forward(self, emb):
         x = self.projector(emb)
         x = x.view(-1, self.channels, self.spatial, self.spatial)
-        x = self.projector(emb)
-        x = x.view(-1, self.channels, self.spatial, self.spatial)
         return self.decoder(x)
 
 
@@ -243,7 +131,7 @@ def main():
     inv = InversionModel(target_size=args.resize).to(device)
 
     opt = optim.Adam(inv.parameters(), lr=args.lr)
-    scaler = torch.cuda.amp.GradScaler(enabled=args.mixed_precision and device.startswith('cuda'))
+    scaler = (torch.amp.GradScaler('cuda') if (args.mixed_precision and device.startswith('cuda')) else None)
 
     start_epoch = 0
     best_psnr = -math.inf
@@ -275,22 +163,31 @@ def main():
         inv.train()
         total_loss = 0.0
         n_batches = 0
+        printed_debug = False
         for emb, target in iter_embed(train_ds, args.embedding_batch_size):
-            autocast_ctx = torch.amp.autocast('cuda') if (args.mixed_precision and device.startswith('cuda')) else torch.autocast(device_type='cpu', enabled=False)
+            if args.mixed_precision and device.startswith('cuda'):
+                autocast_ctx = torch.amp.autocast('cuda')
+            else:
+                from contextlib import nullcontext
+                autocast_ctx = nullcontext()
             with autocast_ctx:
                 pred = inv(emb)
-                if pred.shape != target.shape:
-                    target_resized = torch.nn.functional.interpolate(target, size=pred.shape[-2:], mode='bilinear', align_corners=False)
-                else:
-                    target_resized = target
-                loss_recon = torch.nn.functional.l1_loss(pred, target_resized)
-                # mild tv
+                if not printed_debug:
+                    print(f"Debug shapes -> pred: {list(pred.shape)} target: {list(target.shape)}")
+                    printed_debug = True
+                if pred.shape[-2:] != target.shape[-2:]:
+                    target = torch.nn.functional.interpolate(target, size=pred.shape[-2:], mode='bilinear', align_corners=False)
+                loss_recon = torch.nn.functional.l1_loss(pred, target)
                 tv = (pred[:, :, 1:, :] - pred[:, :, :-1, :]).abs().mean() + (pred[:, :, :, 1:] - pred[:, :, :, :-1]).abs().mean()
                 loss = loss_recon + 0.05 * tv
             opt.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.step(opt)
-            scaler.update()
+            if scaler:
+                scaler.scale(loss).backward()
+                scaler.step(opt)
+                scaler.update()
+            else:
+                loss.backward()
+                opt.step()
             total_loss += float(loss.item())
             n_batches += 1
         avg_loss = total_loss / max(1, n_batches)
@@ -303,11 +200,9 @@ def main():
             with torch.no_grad():
                 for emb, target in iter_embed(test_ds, args.embedding_batch_size):
                     pred = inv(emb)
-                    if pred.shape != target.shape:
-                        target_eval = torch.nn.functional.interpolate(target, size=pred.shape[-2:], mode='bilinear', align_corners=False)
-                    else:
-                        target_eval = target
-                    batch_metrics = metrics_helper.compute(pred, target_eval)
+                    if pred.shape[-2:] != target.shape[-2:]:
+                        target = torch.nn.functional.interpolate(target, size=pred.shape[-2:], mode='bilinear', align_corners=False)
+                    batch_metrics = metrics_helper.compute(pred, target)
                     for k, v in batch_metrics.items():
                         if k == 'psnr':
                             psnr_sum += v
