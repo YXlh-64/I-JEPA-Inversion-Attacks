@@ -14,6 +14,7 @@ import os
 parser = argparse.ArgumentParser()
 parser.add_argument("--custom", action="store_true", default=False,
                     help="If set, run on custom images instead of CIFAR test pairs.")
+parser.add_argument("--batch-size", type=int, default=64, help="Batch size for evaluation over test set")
 args = parser.parse_args()
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -122,25 +123,67 @@ if args.custom:
 # ------------------------------
 else:
     pairs = np.load('data/pairs_sd.npy', allow_pickle=True).item()
-    embeddings = torch.from_numpy(pairs['test_embeddings'])
-    images = torch.from_numpy(pairs['test_images'])
+    embeddings_full = torch.from_numpy(pairs['test_embeddings'])
+    images_full = torch.from_numpy(pairs['test_images'])
 
+    total_mse = 0.0
+    total_ssim = 0.0
+    total_psnr = 0.0
+    total_lpips = 0.0
+    n_images = images_full.shape[0]
+
+    # For saving a visual grid of first few reconstructions
+    vis_orig = []
+    vis_rec = []
+
+    bs = args.batch_size
     with torch.no_grad():
-        emb_batch = embeddings.to(device)
-        img_batch = images.to(device)
-        recon = f_inv(emb_batch)
+        for start in range(0, n_images, bs):
+            end = min(start + bs, n_images)
+            emb_batch = embeddings_full[start:end].to(device)
+            img_batch = images_full[start:end].to(device)
+            recon = f_inv(emb_batch)
 
-        mse_val = mse_loss(recon, img_batch).item()
-        images_norm = (img_batch + 1) / 2
-        recon_norm = (recon + 1) / 2
-        ssim_val = ssim(recon_norm, images_norm, data_range=1.0).item()
-        mse_pixel = mse_loss(recon_norm, images_norm).item()
-        psnr = 10 * torch.log10(torch.tensor(1.0 / (mse_pixel + 1e-12))).item()
-        lpips_val = loss_fn_lpips(recon, img_batch).mean().item()
+            # scale to [0,1] for metrics needing that
+            images_norm = (img_batch + 1) / 2
+            recon_norm = (recon + 1) / 2
 
-        print(f"MSE={mse_val:.6f}, SSIM={ssim_val:.6f}, "
-              f"PSNR={psnr:.6f}, LPIPS={lpips_val:.6f}")
+            # Per-image MSE in original scale [-1,1]
+            mse_vals = torch.mean((recon - img_batch) ** 2, dim=[1,2,3])
+            total_mse += mse_vals.sum().item()
 
-        paired_images = torch.cat([images_norm, recon_norm], dim=3)
-        save_image(paired_images, 'results/sd_comparison.png', nrow=1)
+            # SSIM expects [0,1], compute per batch (library returns batch mean)
+            ssim_batch = ssim(recon_norm, images_norm, data_range=1.0)
+            total_ssim += ssim_batch.item() * (end - start)
+
+            # PSNR per-image: 10 log10(1 / mse_pixel) where mse_pixel computed on [0,1]
+            mse_pixel = torch.mean((recon_norm - images_norm) ** 2, dim=[1,2,3])
+            psnr_vals = 10 * torch.log10(1.0 / (mse_pixel + 1e-12))
+            total_psnr += psnr_vals.sum().item()
+
+            # LPIPS per-image (returns [B,1,1,1] or [B]) depending on version
+            lp = loss_fn_lpips(recon, img_batch)
+            if lp.dim() > 1:
+                lp = lp.view(lp.size(0), -1).mean(dim=1)
+            total_lpips += lp.sum().item()
+
+            if len(vis_orig) < 8:  # store up to first 8 for visualization
+                for i in range(min(end - start, 4)):
+                    vis_orig.append(images_norm[i].cpu())
+                    vis_rec.append(recon_norm[i].cpu())
+
+    avg_mse = total_mse / n_images
+    avg_ssim = total_ssim / n_images
+    avg_psnr = total_psnr / n_images
+    avg_lpips = total_lpips / n_images
+
+    print(f"Averages over {n_images} images -> MSE={avg_mse:.6f} SSIM={avg_ssim:.6f} PSNR={avg_psnr:.6f} LPIPS={avg_lpips:.6f}")
+
+    if vis_orig:
+        pairs_list = []
+        for o, r in zip(vis_orig, vis_rec):
+            pairs_list.append(o)
+            pairs_list.append(r)
+        grid = make_grid(pairs_list, nrow=2)
+        save_image(grid, 'results/sd_comparison.png')
         print("Saved results/sd_comparison.png")

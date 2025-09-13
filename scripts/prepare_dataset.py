@@ -1,117 +1,173 @@
+"""Prepare full CIFAR-10 embeddings + VAE latents.
+
+Changes vs old script:
+ - Uses all 50k CIFAR-10 training images: first 48k for train, last 2k as test (deterministic split).
+ - Batched extraction for I-JEPA embeddings and Stable Diffusion VAE latents (memory efficient).
+ - Memory-mapped storage (.mmap) for images, embeddings, latents to avoid loading all into RAM.
+ - Atomic finalization: build temp directory then rename.
+ - CLI arguments for batch sizes, output dir, precision, etc.
+ - Dataset class loads from memmap on demand.
+"""
+
 import os
-import torch
+import argparse
 import numpy as np
-from torchvision import datasets, transforms
-import torchvision.transforms.functional as TF
+import torch
+from torchvision import datasets
 from transformers import AutoProcessor, AutoModel
 from diffusers import AutoencoderKL
+from PIL import Image
 
-# -------------------------------
-# Device setup
-# -------------------------------
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Using device: {device}")
 
-if device == "cuda":
-    torch.cuda.empty_cache()
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument('--ijepa-name', type=str, default='facebook/ijepa_vith14_1k')
+    p.add_argument('--vae-name', type=str, default='stabilityai/stable-diffusion-2-1')
+    p.add_argument('--vae-subfolder', type=str, default='vae')
+    p.add_argument('--resize-ijepa', type=int, default=224)
+    p.add_argument('--resize-vae', type=int, default=512)
+    p.add_argument('--batch-size', type=int, default=128, help='Batch size for embedding + latent extraction pipeline')
+    p.add_argument('--precision', type=str, default='fp16', choices=['fp32', 'fp16'])
+    p.add_argument('--out-dir', type=str, default='prepared_cifar')
+    p.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
+    return p.parse_args()
 
-# -------------------------------
-# Load I-JEPA
-# -------------------------------
-print("Loading I-JEPA...")
-processor = AutoProcessor.from_pretrained("facebook/ijepa_vith14_1k")
-ijepa = AutoModel.from_pretrained("facebook/ijepa_vith14_1k").to(device)
-ijepa.eval()
 
-# -------------------------------
-# Load Stable Diffusion VAE
-# -------------------------------
-print("Loading Stable Diffusion VAE...")
-vae = AutoencoderKL.from_pretrained(
-    "stabilityai/stable-diffusion-2-1",
-    subfolder="vae"
-).to(device)
-vae.eval()
+def prepare_memmaps(out_dir, n_train, n_test, emb_dim, latent_shape):
+    os.makedirs(out_dir, exist_ok=True)
+    # Shapes
+    img_shape = (3, 512, 512)
+    train = {
+        'images': np.memmap(os.path.join(out_dir, 'train_images.mmap'), dtype='uint8', mode='w+', shape=(n_train, *img_shape)),
+        'embeddings': np.memmap(os.path.join(out_dir, 'train_embeddings.mmap'), dtype='float32', mode='w+', shape=(n_train, emb_dim)),
+        'latents': np.memmap(os.path.join(out_dir, 'train_latents.mmap'), dtype='float32', mode='w+', shape=(n_train, *latent_shape)),
+    }
+    test = {
+        'images': np.memmap(os.path.join(out_dir, 'test_images.mmap'), dtype='uint8', mode='w+', shape=(n_test, *img_shape)),
+        'embeddings': np.memmap(os.path.join(out_dir, 'test_embeddings.mmap'), dtype='float32', mode='w+', shape=(n_test, emb_dim)),
+        'latents': np.memmap(os.path.join(out_dir, 'test_latents.mmap'), dtype='float32', mode='w+', shape=(n_test, *latent_shape)),
+    }
+    return train, test
 
-# -------------------------------
-# Embedding extraction function
-# -------------------------------
-def extract_embedding(image):
-    """Extract I-JEPA embedding from a PIL image."""
-    img_224 = image.resize((224, 224))
-    inputs = processor(img_224, return_tensors="pt").to(device)
+
+def main():
+    args = parse_args()
+    device = args.device
+    print(f"Device: {device}")
+
+    print('Loading CIFAR-10 (train split only)...')
+    cifar = datasets.CIFAR10(root='./data', train=True, download=True)
+    total = len(cifar.data)  # 50000
+    assert total == 50000, 'Unexpected CIFAR-10 size'
+    train_indices = list(range(0, 48000))
+    test_indices = list(range(48000, 50000))
+
+    # Load models
+    print('Loading I-JEPA backbone...')
+    processor = AutoProcessor.from_pretrained(args.ijepa_name)
+    ijepa = AutoModel.from_pretrained(args.ijepa_name).to(device)
+    ijepa.eval()
+
+    print('Loading SD VAE...')
+    vae = AutoencoderKL.from_pretrained(args.vae_name, subfolder=args.vae_subfolder).to(device)
+    vae.eval()
+
+    # Determine embedding dimension
     with torch.no_grad():
-        outputs = ijepa(**inputs)
-    return outputs.last_hidden_state.mean(dim=1).squeeze(0)  # [dim]
+        dummy = processor(Image.fromarray(cifar.data[0]).resize((args.resize_ijepa, args.resize_ijepa)), return_tensors='pt')
+        dummy = {k: v.to(device) for k, v in dummy.items()}
+        emb_dim = ijepa(**dummy).last_hidden_state.shape[-1]
+    print(f'Embedding dim: {emb_dim}')
 
-# -------------------------------
-# Load CIFAR-10 dataset
-# -------------------------------
-print("Loading CIFAR-10...")
-cifar_train = datasets.CIFAR10(root='./data', train=True, download=True)
-cifar_test = datasets.CIFAR10(root='./data', train=False, download=True)
-
-# Limit dataset size
-train_limit = 10000
-test_limit = 100
-
-# Resize to 512 for VAE
-train_images = [cifar_train[i][0].resize((512, 512)) for i in range(train_limit)]
-test_images  = [cifar_test[i][0].resize((512, 512)) for i in range(test_limit)]
-
-# -------------------------------
-# Compute embeddings & tensors
-# -------------------------------
-print("Extracting embeddings... (train)")
-train_embeddings = [extract_embedding(img).cpu() for img in train_images]
-train_tensors = torch.stack([TF.to_tensor(img) for img in train_images]).to(device)
-
-print("Extracting embeddings... (test)")
-test_embeddings = [extract_embedding(img).cpu() for img in test_images]
-test_tensors = torch.stack([TF.to_tensor(img) for img in test_images]).to(device)
-
-# -------------------------------
-# Compute latents via VAE
-# -------------------------------
-def encode_latents(images):
+    # Determine latent shape
     with torch.no_grad():
-        return vae.encode(images * 2 - 1).latent_dist.sample() * vae.config.scaling_factor
+        from torchvision.transforms.functional import to_tensor
+        pil = Image.fromarray(cifar.data[0]).resize((args.resize_vae, args.resize_vae))
+        t = to_tensor(pil).unsqueeze(0).to(device) * 2 - 1
+        lat = vae.encode(t).latent_dist.sample() * vae.config.scaling_factor
+        latent_shape = tuple(lat.shape[1:])
+    print(f'Latent shape: {latent_shape}')
 
-print("Encoding latents...")
-train_latents = encode_latents(train_tensors)
-test_latents  = encode_latents(test_tensors)
+    # Prepare memmaps
+    temp_dir = args.out_dir + '_tmp'
+    if os.path.exists(temp_dir):
+        print('Temporary directory exists, removing old files (partial previous run).')
+        for f in os.listdir(temp_dir):
+            os.remove(os.path.join(temp_dir, f))
+    os.makedirs(temp_dir, exist_ok=True)
+    train_maps, test_maps = prepare_memmaps(temp_dir, len(train_indices), len(test_indices), emb_dim, latent_shape)
 
-train_embeddings = torch.stack(train_embeddings)
-test_embeddings  = torch.stack(test_embeddings)
+    # Extraction function (batched)
+    def process_indices(indices, maps, split_name):
+        from torchvision.transforms.functional import to_tensor
+        bs = args.batch_size
+        n = len(indices)
+        print(f'Processing {split_name}: {n} images')
+        for start in range(0, n, bs):
+            end = min(start + bs, n)
+            batch_indices = indices[start:end]
+            pil_batch_vae = [Image.fromarray(cifar.data[i]).resize((args.resize_vae, args.resize_vae)) for i in batch_indices]
+            pil_batch_emb = [img.resize((args.resize_ijepa, args.resize_ijepa)) for img in pil_batch_vae]
 
-# -------------------------------
-# Save precomputed dataset
-# -------------------------------
-os.makedirs("data", exist_ok=True)
+            # Prepare processor inputs for embeddings
+            inputs = processor(pil_batch_emb, return_tensors='pt')
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            with torch.no_grad():
+                feats = ijepa(**inputs).last_hidden_state.mean(dim=1)  # [B, emb_dim]
 
-np.save("data/train_pairs.npy", {
-    "images": train_tensors.cpu().numpy(),
-    "embeddings": train_embeddings.cpu().numpy(),
-    "latents": train_latents.cpu().numpy(),
-})
-np.save("data/test_pairs.npy", {
-    "images": test_tensors.cpu().numpy(),
-    "embeddings": test_embeddings.cpu().numpy(),
-    "latents": test_latents.cpu().numpy(),
-})
+            # Images tensor for VAE (scaled to [-1,1])
+            imgs_tensor = torch.stack([to_tensor(p) for p in pil_batch_vae]).to(device) * 2 - 1
+            with torch.no_grad():
+                latents = vae.encode(imgs_tensor).latent_dist.sample() * vae.config.scaling_factor
 
-print("Saved: data/train_pairs.npy & data/test_pairs.npy")
+            # Store (convert images to uint8 [0,255])
+            imgs_uint8 = ( (imgs_tensor * 0.5 + 0.5).clamp(0,1) * 255 ).byte().cpu().numpy()
+            feats_np = feats.cpu().numpy()
+            lat_np = latents.cpu().numpy()
 
-# -------------------------------
-# Dataset class for later training
-# -------------------------------
-class InversionDataset(torch.utils.data.Dataset):
-    def __init__(self, embeddings, latents):
-        self.embeddings = embeddings
-        self.latents = latents
+            maps['images'][start:end] = imgs_uint8
+            maps['embeddings'][start:end] = feats_np
+            maps['latents'][start:end] = lat_np
 
-    def __len__(self):
-        return len(self.embeddings)
+            if (start // bs) % 20 == 0:
+                print(f'  [{end}/{n}] done')
 
-    def __getitem__(self, idx):
-        return self.embeddings[idx], self.latents[idx]
+    process_indices(train_indices, train_maps, 'train')
+    process_indices(test_indices, test_maps, 'test')
+
+    # Flush memmaps
+    for d in (train_maps, test_maps):
+        for mm in d.values():
+            mm.flush()
+
+    # Write meta file
+    meta = {
+        'train_size': len(train_indices),
+        'test_size': len(test_indices),
+        'embedding_dim': emb_dim,
+        'latent_shape': latent_shape,
+        'image_shape': (3, 512, 512),
+    'ijepa_model': args.ijepa_name,
+    'vae_model': args.vae_name,
+        'split': {'train': [0, 48000], 'test': [48000, 50000]},
+    }
+    import json
+    with open(os.path.join(temp_dir, 'meta.json'), 'w') as f:
+        json.dump(meta, f, indent=2)
+
+    # Atomic rename
+    if os.path.exists(args.out_dir):
+        print('Removing previous output directory (backup not kept).')
+        for f in os.listdir(args.out_dir):
+            os.remove(os.path.join(args.out_dir, f))
+        os.rmdir(args.out_dir)
+    os.rename(temp_dir, args.out_dir)
+    print(f'Finished. Data stored under {args.out_dir}')
+
+    # Provide dataset class snippet
+    print('\nUse the following dataset class to load memory-mapped data:')
+    print('''\nclass MemmapInversionDataset(torch.utils.data.Dataset):\n    def __init__(self, root, split="train"):\n        import json, os, numpy as np\n        with open(os.path.join(root, 'meta.json')) as f: meta = json.load(f)\n        self.split = split\n        if split == 'train': size = meta['train_size']\n        else: size = meta['test_size']\n        self.emb = np.memmap(os.path.join(root, f"{split}_embeddings.mmap"), mode='r', dtype='float32', shape=(size, meta['embedding_dim']))\n        latent_shape = tuple(meta['latent_shape'])\n        self.lat = np.memmap(os.path.join(root, f"{split}_latents.mmap"), mode='r', dtype='float32', shape=(size, *latent_shape))\n    def __len__(self): return self.emb.shape[0]\n    def __getitem__(self, idx):\n        return torch.from_numpy(self.emb[idx]), torch.from_numpy(self.lat[idx])\n''')
+
+
+if __name__ == '__main__':
+    main()
