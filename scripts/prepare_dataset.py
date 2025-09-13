@@ -18,6 +18,50 @@ from transformers import AutoProcessor, AutoModel
 from diffusers import AutoencoderKL
 from PIL import Image
 
+# ---------------------------------------------------------------------------
+# Lightweight tensor-backed dataset used by training scripts (DO / DB / DMB).
+# The scripts expect: from prepare_dataset import InversionDataset
+# It simply wraps two tensors (embeddings, targets) and returns pairs.
+# targets can be images or latents depending on the training variant.
+# ---------------------------------------------------------------------------
+class InversionDataset(torch.utils.data.Dataset):
+    """Simple dataset for (embedding, target) pairs.
+
+    Parameters
+    ----------
+    embeddings : torch.Tensor (N, D)
+        Feature embeddings (e.g. IJepa pooled representations).
+    targets : torch.Tensor
+        Corresponding target tensors (e.g. images (N,3,H,W) or latents (N,C,H,W)).
+    dtype : torch.dtype, optional
+        If provided, casts embeddings & targets to this dtype (default: keep as is except ensure float32 for floating types).
+    """
+    def __init__(self, embeddings: torch.Tensor, targets: torch.Tensor, dtype: torch.dtype | None = None):
+        if len(embeddings) != len(targets):
+            raise ValueError(f"Mismatched lengths: {len(embeddings)} vs {len(targets)}")
+        # Avoid unnecessary copies; cast if requested.
+        if dtype is not None:
+            embeddings = embeddings.to(dtype)
+            # Only cast targets if floating; keep integer types (e.g. uint8 images) intact.
+            if torch.is_floating_point(targets):
+                targets = targets.to(dtype)
+        else:
+            # Ensure float32 for common floating inputs to match model expectations.
+            if torch.is_floating_point(embeddings) and embeddings.dtype != torch.float32:
+                embeddings = embeddings.float()
+            if torch.is_floating_point(targets) and targets.dtype != torch.float32:
+                targets = targets.float()
+        self.embeddings = embeddings
+        self.targets = targets
+
+    def __len__(self):
+        return self.embeddings.shape[0]
+
+    def __getitem__(self, idx: int):
+        return self.embeddings[idx], self.targets[idx]
+
+__all__ = ["InversionDataset"]
+
 
 def parse_args():
     p = argparse.ArgumentParser()
