@@ -74,6 +74,8 @@ def parse_args():
     p.add_argument('--precision', type=str, default='fp16', choices=['fp32', 'fp16'])
     p.add_argument('--out-dir', type=str, default='prepared_data')
     p.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
+    p.add_argument('--train-limit', type=int, default=5000, help='Number of training samples to store (<= 48000)')
+    p.add_argument('--test-limit', type=int, default=100, help='Number of test samples to store (<= 2000)')
     return p.parse_args()
 
 
@@ -103,8 +105,15 @@ def main():
     cifar = datasets.CIFAR10(root='./data', train=True, download=True)
     total = len(cifar.data)  # 50000
     assert total == 50000, 'Unexpected CIFAR-10 size'
-    train_indices = list(range(0, 48000))
-    test_indices = list(range(48000, 50000))
+    # Pools
+    train_pool = list(range(0, 48000))
+    test_pool = list(range(48000, 50000))
+    # Enforce limits deterministically by taking the first K from each pool
+    train_k = max(0, min(args.train_limit, len(train_pool)))
+    test_k = max(0, min(args.test_limit, len(test_pool)))
+    train_indices = train_pool[:train_k]
+    test_indices = test_pool[:test_k]
+    print(f"Using limits: train={len(train_indices)} (of 48000), test={len(test_indices)} (of 2000)")
 
     # Load models
     print('Loading I-JEPA backbone...')
@@ -191,9 +200,10 @@ def main():
         'embedding_dim': emb_dim,
         'latent_shape': latent_shape,
         'image_shape': (3, 512, 512),
-    'ijepa_model': args.ijepa_name,
-    'vae_model': args.vae_name,
-        'split': {'train': [0, 48000], 'test': [48000, 50000]},
+        'ijepa_model': args.ijepa_name,
+        'vae_model': args.vae_name,
+        'split_pools': {'train_pool': [0, 48000], 'test_pool': [48000, 50000]},
+        'limits': {'train_limit': args.train_limit, 'test_limit': args.test_limit},
     }
     import json
     with open(os.path.join(temp_dir, 'meta.json'), 'w') as f:

@@ -1,5 +1,5 @@
-
 import argparse, os, json, math, sys, time, random
+from contextlib import nullcontext
 import numpy as np
 import torch
 import torch.optim as optim
@@ -72,7 +72,7 @@ def parse_args():
     ap.add_argument('--batch-size', type=int, default=32)
     ap.add_argument('--lr', type=float, default=1e-3)
     ap.add_argument('--proj-channels', type=int, default=128)
-    ap.add_argument('--spatial', type=int, default=16)
+    ap.add_argument('--spatial', type=int, default=0, help='(Optional) internal spatial size; 0=auto from latent grid.')
     ap.add_argument('--mixed-precision', action='store_true')
     ap.add_argument('--eval-every', type=int, default=1)
     ap.add_argument('--seed', type=int, default=42)
@@ -81,6 +81,10 @@ def parse_args():
     ap.add_argument('--print-freq', type=int, default=100)
     ap.add_argument('--grad-accum', type=int, default=1)
     ap.add_argument('--resume', type=str, default='')
+    ap.add_argument('--save-samples', type=int, default=4, help='Save this many reconstructed image grids each eval (0=disable).')
+    ap.add_argument('--sample-dir', type=str, default='samples_db')
+    ap.add_argument('--l2-weight', type=float, default=1.0, help='Weight for image-domain MSE loss.')
+    ap.add_argument('--latent-loss-weight', type=float, default=0.0, help='Optional auxiliary latent MSE weight.')
     return ap.parse_args()
 
 
@@ -96,10 +100,17 @@ def main():
 
     emb_dim = train_ds.emb.shape[1]
     out_ch = train_ds.lat.shape[1]
-    model = LatentInversionModel(embedding_dim=emb_dim, proj_C=args.proj_channels, spatial=args.spatial, out_channels=out_ch).to(device)
+    latent_h, latent_w = train_ds.lat.shape[-2], train_ds.lat.shape[-1]
+    internal_spatial = args.spatial if args.spatial > 0 else latent_h
+    if internal_spatial != latent_h:
+        print(f"[INFO] Internal spatial {internal_spatial} differs from latent grid {latent_h}; will upsample predicted latents.")
+    model = LatentInversionModel(embedding_dim=emb_dim, proj_C=args.proj_channels, spatial=internal_spatial, out_channels=out_ch).to(device)
 
     vae = AutoencoderKL.from_pretrained('stabilityai/stable-diffusion-2-1', subfolder='vae').to(device)
     vae.eval()
+    # Freeze VAE params (we still need autograd ops for predicted latents, but not parameter grads)
+    for p in vae.parameters():
+        p.requires_grad = False
 
     opt = optim.Adam(model.parameters(), lr=args.lr)
     scaler = torch.amp.GradScaler('cuda') if (args.mixed_precision and device.startswith('cuda')) else None
@@ -133,8 +144,15 @@ def main():
             'best_psnr': pscore,
         }, os.path.join(args.save_dir, name))
 
-    def decode(lat_batch):
-        # Expect latents already scaled; original latents were stored as sampled * scaling_factor
+    # Latent ground-truth spatial size already captured
+
+    def decode_pred(lat_batch):
+        # Allow gradient to flow from image space back to predicted latent.
+        imgs = vae.decode(lat_batch / vae.config.scaling_factor).sample  # [-1,1]
+        return imgs
+
+    def decode_target(lat_batch):
+        # No gradient needed for target image.
         with torch.no_grad():
             imgs = vae.decode(lat_batch / vae.config.scaling_factor).sample
         return imgs
@@ -151,9 +169,13 @@ def main():
             ctx = torch.amp.autocast(device_type='cuda', enabled=autocast_enabled) if device.startswith('cuda') else torch.amp.autocast(device_type='cpu', enabled=False)
             with ctx:
                 pred_lat = model(emb)
-                recon = decode(pred_lat)
-                target_img = decode(lat)
-                loss = F.mse_loss(recon, target_img) / args.grad_accum
+                if pred_lat.shape[-1] != latent_w or pred_lat.shape[-2] != latent_h:
+                    pred_lat = torch.nn.functional.interpolate(pred_lat, size=(latent_h, latent_w), mode='bilinear', align_corners=False)
+                recon = decode_pred(pred_lat)
+                target_img = decode_target(lat)
+                img_loss = F.mse_loss(recon, target_img)
+                aux_lat = F.mse_loss(pred_lat, lat) if args.latent_loss_weight > 0 else 0.0
+                loss = (args.l2_weight * img_loss + args.latent_loss_weight * aux_lat) / args.grad_accum
             if scaler:
                 scaler.scale(loss).backward()
             else:
@@ -180,11 +202,23 @@ def main():
             for emb, lat in test_loader:
                 emb, lat = emb.to(device), lat.to(device)
                 pred_lat = model(emb)
-                recon = decode(pred_lat)
-                target_img = decode(lat)
+                if pred_lat.shape[-1] != latent_w or pred_lat.shape[-2] != latent_h:
+                    pred_lat = torch.nn.functional.interpolate(pred_lat, size=(latent_h, latent_w), mode='bilinear', align_corners=False)
+                recon = decode_pred(pred_lat)
+                target_img = decode_target(lat)
                 p = psnr(recon, target_img)
-                psum += p.item()
-                nb += 1
+                if args.save_samples and nb < args.save_samples:
+                    # Save recon grid progress
+                    os.makedirs(args.sample_dir, exist_ok=True)
+                    try:
+                        import torchvision.utils as vutils
+                        pair = torch.cat([target_img[:2], recon[:2]], dim=0)
+                        pair = (pair * 0.5 + 0.5).clamp(0,1)
+                        vutils.save_image(pair, os.path.join(args.sample_dir, f'epoch{epoch:03d}_sample{nb}.png'), nrow=2)
+                    except Exception as e:
+                        if nb == 0:
+                            print(f"[WARN] sample save failed: {e}")
+                psum += p.item(); nb += 1
         return psum / max(1, nb)
 
     for epoch in range(start_epoch, args.epochs):

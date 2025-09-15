@@ -63,13 +63,13 @@ def psnr(recon, target):
 
 
 def parse_args():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description='Diffusion-model-based inversion: embedding -> UNet -> z_T -> DM decode')
     ap.add_argument('--prepared-root', type=str, default='prepared_data')
     ap.add_argument('--epochs', type=int, default=10)
     ap.add_argument('--batch-size', type=int, default=2)
     ap.add_argument('--lr', type=float, default=1e-3)
     ap.add_argument('--proj-channels', type=int, default=128)
-    ap.add_argument('--spatial', type=int, default=16)
+    ap.add_argument('--spatial', type=int, default=0, help='Internal UNet spatial size; 0=auto (latent grid).')
     ap.add_argument('--mixed-precision', action='store_true')
     ap.add_argument('--eval-every', type=int, default=1)
     ap.add_argument('--seed', type=int, default=42)
@@ -80,6 +80,8 @@ def parse_args():
     ap.add_argument('--resume', type=str, default='')
     ap.add_argument('--num-inference-steps', type=int, default=30, help='Diffusion steps during training inference')
     ap.add_argument('--predict-latents', action='store_true', help='Predict initial latent then decode with VAE (skip full SD pipeline).')
+    ap.add_argument('--guidance-scale', type=float, default=1.0, help='Classifier-free guidance scale for DM (1.0 = off).')
+    ap.add_argument('--normalize-latents', action='store_true', help='Normalize predicted latents to scheduler init sigma per-sample.')
     return ap.parse_args()
 
 
@@ -94,14 +96,28 @@ def main():
     print(f'Train size: {len(train_ds)}  Test size: {len(test_ds)}')
 
     emb_dim = train_ds.emb.shape[1]
-    model = ZTInversionModel(embedding_dim=emb_dim, proj_C=args.proj_channels, spatial=args.spatial, out_channels=4).to(device)
+    # Read latent grid from meta for auto sizing
+    with open(os.path.join(args.prepared_root, 'meta.json')) as f:
+        meta = json.load(f)
+    lat_h, lat_w = meta['latent_shape'][-2], meta['latent_shape'][-1]
+    spatial = args.spatial if args.spatial > 0 else lat_h
+    if spatial != lat_h:
+        print(f"[INFO] Using internal spatial={spatial}, latent grid={lat_h}; will upsample predicted z_T to latent grid.")
+    model = ZTInversionModel(embedding_dim=emb_dim, proj_C=args.proj_channels, spatial=spatial, out_channels=4).to(device)
 
     # For predict-latents fast path use only VAE (like decoder-based), else full SD pipeline from predicted z_T
     vae = AutoencoderKL.from_pretrained('stabilityai/stable-diffusion-2-1', subfolder='vae').to(device)
     vae.eval()
     pipe = None
     if not args.predict_latents:
-        pipe = StableDiffusionPipeline.from_pretrained('stabilityai/stable-diffusion-2-1').to(device)
+        pipe = StableDiffusionPipeline.from_pretrained('stabilityai/stable-diffusion-2-1')
+        # optional memory savings
+        try:
+            pipe.enable_attention_slicing()
+            pipe.enable_vae_slicing()
+        except Exception:
+            pass
+        pipe = pipe.to(device)
         pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
         pipe.set_progress_bar_config(disable=True)
 
@@ -140,10 +156,20 @@ def main():
     def decode_from_pred(pred):
         if args.predict_latents:
             with torch.no_grad():
+                # Ensure latent grid
+                if pred.shape[-1] != lat_w or pred.shape[-2] != lat_h:
+                    pred = torch.nn.functional.interpolate(pred, size=(lat_h, lat_w), mode='bilinear', align_corners=False)
                 return vae.decode(pred / vae.config.scaling_factor).sample
         # Full diffusion path: treat pred as starting latent (initial noise) and run denoise
         with torch.no_grad():
-            out = pipe(prompt=[""] * pred.shape[0], latents=pred, num_inference_steps=args.num_inference_steps, output_type='pt')
+            # Match latent grid and scale to scheduler init sigma if requested
+            if pred.shape[-1] != lat_w or pred.shape[-2] != lat_h:
+                pred = torch.nn.functional.interpolate(pred, size=(lat_h, lat_w), mode='bilinear', align_corners=False)
+            if args.normalize_latents:
+                sigma = pipe.scheduler.init_noise_sigma
+                std = pred.flatten(1).std(dim=1, keepdim=True).clamp(min=1e-6)
+                pred = pred / std.view(-1,1,1,1) * sigma
+            out = pipe(prompt=[""] * pred.shape[0], latents=pred, guidance_scale=args.guidance_scale, num_inference_steps=args.num_inference_steps, output_type='pt')
             return out.images
 
     def train_epoch(epoch):
