@@ -82,3 +82,24 @@ python attacks/attack_dmb.py
 * Output:
   * Test MSE loss printed to console.
   * Comparison images saved in `results/*_comparison.png` (original images on the left, reconstructed on the right).
+
+## One-shot pipeline runner
+
+You can run the whole pipeline (prepare dataset ➜ train DO/DB/DMB ➜ run attacks) with the helper script:
+
+```fish
+# Optional overrides as env vars (fish shell)
+set -x TRAIN_LIMIT 5000
+set -x TEST_LIMIT 100
+set -x EPOCHS_DO 10
+set -x EPOCHS_DB 10
+set -x EPOCHS_DMB 5
+set -x DMB_PREDICT_LATENTS 1  # set to 0 to use full diffusion steps
+
+./run_all.sh
+```
+
+This will:
+- Prepare memmaps under `prepared_data/` with the specified limits
+- Train all three models (checkpoints under `checkpoints_*/`)
+- Run the three attacks and save result grids to `results/`
